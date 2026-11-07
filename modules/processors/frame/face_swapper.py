@@ -510,6 +510,298 @@ def _fast_paste_back(target_img: Frame, bgr_fake: np.ndarray, aimg: np.ndarray, 
     return target_img
 
 
+def _warp_face_to_frame(
+    frame_shape: Tuple[int, ...], bgr_fake: np.ndarray, M: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Warp an aligned 128x128 swapped face back onto full-frame canvases.
+
+    Uses the exact bbox/pad/translate arithmetic of ``_fast_paste_back`` so
+    the transparent layer shares the normal export's geometry pixel for
+    pixel. Returns (face_bgr, alpha_uint8) at the target frame size; both are
+    zero outside the face crop.
+    """
+    h, w = frame_shape[:2]
+    face_h, face_w = bgr_fake.shape[:2]
+    assert face_h == face_w, f"Expected square aligned face, got {face_h}x{face_w}"
+    IM = cv2.invertAffineTransform(M)
+
+    corners = np.array(
+        [[0, 0], [face_w, 0], [face_w, face_h], [0, face_h]], dtype=np.float32
+    )
+    transformed = (IM[:, :2] @ corners.T).T + IM[:, 2]
+    x1 = int(np.floor(transformed[:, 0].min()))
+    x2 = int(np.ceil(transformed[:, 0].max()))
+    y1 = int(np.floor(transformed[:, 1].min()))
+    y2 = int(np.ceil(transformed[:, 1].max()))
+    if x1 >= x2 or y1 >= y2:
+        raise RuntimeError("Degenerate face warp transform.")
+
+    pad = 2
+    y1p, y2p = max(0, y1 - pad), min(h, y2 + pad + 1)
+    x1p, x2p = max(0, x1 - pad), min(w, x2 + pad + 1)
+
+    IM_crop = IM.copy()
+    IM_crop[0, 2] -= x1p
+    IM_crop[1, 2] -= y1p
+    crop_w, crop_h = x2p - x1p, y2p - y1p
+
+    soft_alpha = _get_soft_alpha(face_h)
+    bgr_fake_crop = cv2.warpAffine(
+        bgr_fake, IM_crop, (crop_w, crop_h), borderMode=cv2.BORDER_REPLICATE
+    )
+    alpha_crop = cv2.warpAffine(
+        soft_alpha, IM_crop, (crop_w, crop_h), borderValue=0
+    )
+
+    face_full = np.zeros((h, w, 3), dtype=np.uint8)
+    alpha_full = np.zeros((h, w), dtype=np.uint8)
+    face_full[y1p:y2p, x1p:x2p] = bgr_fake_crop
+    alpha_full[y1p:y2p, x1p:x2p] = alpha_crop
+    return face_full, alpha_full
+
+
+# ───────────────────── transparent face layer export ─────────────────────
+# Single-face JPEG image exports can additionally produce a transparent PNG
+# containing only the swapped face, parked exactly where it belongs. Dropping
+# that layer over the untouched target in an image editor reproduces the
+# normal full-image export:
+#
+#   paste-back:           out = a*F + (1-a)*T        (a = feathered soft alpha)
+#   with swap strength o: out = o*a*F + (1-o*a)*T
+#   + keep-mouth mask m:  out = o*(1-m)*a*F + (1-o*(1-m)*a)*T
+#
+# so the layer keeps RGB = F and a single alpha A = o*(1-m)*a. The feather,
+# swap strength and the kept-original-mouth hole live entirely in alpha; the
+# RGB channels never carry target/background colour.
+
+# The layer export is offered for JPEG targets only (per product spec).
+TRANSPARENT_LAYER_TARGET_EXTS = (".jpg", ".jpeg")
+
+
+def transparent_layer_available() -> Tuple[bool, str]:
+    """Whether the transparent face-layer export is allowed right now.
+
+    Returns (True, "") or (False, reason). The reason is an English status
+    string (translated by the UI layer) explaining the first failed rule.
+    """
+    target_path = getattr(modules.globals, "target_path", None)
+    if not target_path or os.path.splitext(target_path)[1].lower() not in TRANSPARENT_LAYER_TARGET_EXTS:
+        return False, "Transparent face layer is available only for JPEG target images."
+    if getattr(modules.globals, "many_faces", False):
+        return False, "Turn off Many faces to export a transparent face layer."
+    if getattr(modules.globals, "map_faces", False):
+        return False, "Turn off Map faces to export a transparent face layer."
+    if any(modules.globals.fp_ui.values()):
+        return False, "Set Face Enhancer to None to export a transparent face layer."
+    if getattr(modules.globals, "poisson_blend", False):
+        return False, "Turn off Poisson Blend to export a transparent face layer."
+    try:
+        sharpness = float(getattr(modules.globals, "sharpness", 0.0))
+    except (TypeError, ValueError):
+        sharpness = 0.0
+    if sharpness != 0.0:
+        return False, "Set Sharpness to 0 to export a transparent face layer."
+    return True, ""
+
+
+def _build_mouth_feather_mask(
+    frame_shape: Tuple[int, ...],
+    mouth_box: tuple,
+    mouth_polygon: np.ndarray,
+) -> np.ndarray:
+    """Full-frame float32 mask (0.0-1.0) of the kept-original-mouth region.
+
+    The polygon/feather math is the single source of truth shared with
+    ``apply_mouth_area`` so the transparent layer's alpha cut-out matches
+    the normal export's mouth blend pixel for pixel.
+    """
+    frame_h, frame_w = frame_shape[:2]
+    full_mask = np.zeros((frame_h, frame_w), dtype=np.float32)
+
+    try:
+        min_x, min_y, max_x, max_y = map(int, mouth_box)
+    except (TypeError, ValueError):
+        return full_mask
+
+    # Same clamping as apply_mouth_area before it extracts its ROI.
+    min_y, max_y = max(0, min_y), min(frame_h, max_y)
+    min_x, max_x = max(0, min_x), min(frame_w, max_x)
+    box_w, box_h = max_x - min_x, max_y - min_y
+    if box_w <= 0 or box_h <= 0 or mouth_polygon is None or len(mouth_polygon) < 3:
+        return full_mask
+
+    polygon_mask_roi = np.zeros((box_h, box_w), dtype=np.uint8)
+    adjusted_polygon = mouth_polygon - [min_x, min_y]
+    cv2.fillPoly(polygon_mask_roi, [adjusted_polygon.astype(np.int32)], 255)
+
+    # Identical feather to apply_mouth_area.
+    feather_amount = max(1, min(30, min(box_w, box_h) // 8))
+    kernel_size = 2 * feather_amount + 1
+    feathered_mask = cv2.GaussianBlur(
+        polygon_mask_roi.astype(np.float32), (kernel_size, kernel_size), 0
+    )
+    max_val = feathered_mask.max()
+    if max_val > 1e-6:
+        feathered_mask = feathered_mask / max_val
+    else:
+        feathered_mask.fill(0.0)
+
+    full_mask[min_y:max_y, min_x:max_x] = feathered_mask
+    return full_mask
+
+
+def build_face_layer(
+    source_face: Face, target_face: Face, target_frame: Frame
+) -> np.ndarray:
+    """Build the transparent BGRA face layer for one target frame.
+
+    Output has the same HxW as ``target_frame``: the swapped face colours sit
+    at their original position with the feathered elliptical alpha, scaled by
+    swap strength (opacity) and punched out where the original mouth is kept.
+    Every pixel outside the face is fully transparent.
+    """
+    face_swapper = get_face_swapper()
+    if face_swapper is None:
+        raise RuntimeError("Face swapper model not loaded or failed to load.")
+    if source_face is None or target_face is None:
+        raise ValueError("Both source and target faces are required.")
+    if not hasattr(source_face, "normed_embedding") or source_face.normed_embedding is None:
+        raise ValueError("Source face has no identity embedding.")
+
+    frame = target_frame
+    if frame.dtype != np.uint8:
+        frame = np.clip(frame, 0, 255).astype(np.uint8)
+    if not frame.flags["C_CONTIGUOUS"]:
+        frame = np.ascontiguousarray(frame)
+
+    if any("DmlExecutionProvider" in p for p in modules.globals.execution_providers):
+        with modules.globals.dml_lock:
+            bgr_fake, M = face_swapper.get(
+                frame, target_face, source_face, paste_back=False
+            )
+    else:
+        bgr_fake, M = face_swapper.get(
+            frame, target_face, source_face, paste_back=False
+        )
+
+    if bgr_fake is None or not isinstance(bgr_fake, np.ndarray):
+        raise RuntimeError("Face swap model produced no result.")
+
+    h, w = frame.shape[:2]
+
+    # Mirror _fast_paste_back's crop/translate warps on full-frame canvases,
+    # pixel for pixel (same bbox, same pad, same border modes): the layer must
+    # composite to exactly the normal export. Outside the face crop the colour
+    # canvas is black and alpha is zero, so those pixels never show.
+    face_full, alpha = _warp_face_to_frame(frame.shape, bgr_fake, M)
+    alpha = alpha.astype(np.float32)
+
+    # Swap strength: fading the swap is fading the layer's opacity.
+    opacity = getattr(modules.globals, "opacity", 1.0)
+    try:
+        opacity = max(0.0, min(1.0, float(opacity)))
+    except (TypeError, ValueError):
+        opacity = 1.0
+    alpha *= opacity
+
+    # Keep-original-mouth: hole the feathered mouth region out of alpha so
+    # compositing leaves the target's own mouth there, exactly like the
+    # normal export's mouth blend.
+    if getattr(modules.globals, "mouth_mask", False):
+        mouth_mask, mouth_cutout, mouth_box, lower_lip_polygon = (
+            create_lower_mouth_mask(target_face, target_frame)
+        )
+        if mouth_cutout is not None and mouth_box != (0, 0, 0, 0):
+            mouth_keep = _build_mouth_feather_mask(
+                (h, w), mouth_box, lower_lip_polygon
+            )
+            alpha *= np.float32(1.0) - mouth_keep
+
+    alpha_u8 = np.clip(alpha, 0, 255).astype(np.uint8)
+    return np.dstack([face_full, alpha_u8])
+
+
+def process_image_layer(source_path: str, target_path: str, output_path: str) -> bool:
+    """Export the single swapped face as a transparent PNG layer.
+
+    Returns True only when the PNG was written. Every failure (unreadable
+    input, missing source/target face, zero swap strength, processing or
+    save error) reports a specific reason and leaves no output behind:
+    the PNG is encoded to a sibling temp file and atomically renamed into
+    place only on success.
+    """
+    global PREVIOUS_FRAME_RESULT
+    PREVIOUS_FRAME_RESULT = None
+
+    try:
+        target_frame = imread_unicode(target_path)
+    except Exception as read_e:
+        update_status(f"Error reading target image {target_path}: {read_e}", NAME)
+        return False
+    if target_frame is None:
+        update_status(f"Error: Could not read target image: {target_path}", NAME)
+        return False
+
+    try:
+        source_img = imread_unicode(source_path) if source_path else None
+    except Exception as read_e:
+        update_status(f"Error reading source image {source_path}: {read_e}", NAME)
+        return False
+    if source_img is None:
+        update_status(f"Error: Could not read source image: {source_path}", NAME)
+        return False
+
+    source_face = get_one_face(source_img)
+    del source_img
+    if source_face is None:
+        update_status(f"Error: No face found in source image: {source_path}", NAME)
+        return False
+
+    try:
+        opacity = float(getattr(modules.globals, "opacity", 1.0))
+    except (TypeError, ValueError):
+        opacity = 1.0
+    if opacity <= 0.0:
+        update_status(
+            "Swap strength is 0 - nothing to swap. Increase the swap strength and try again.",
+            NAME,
+        )
+        return False
+
+    target_face = get_one_face(target_frame)
+    if target_face is None:
+        update_status(f"Error: No face found in target image: {target_path}", NAME)
+        return False
+
+    try:
+        layer = build_face_layer(source_face, target_face, target_frame)
+    except Exception as build_e:
+        update_status(f"Error building transparent face layer: {build_e}", NAME)
+        return False
+
+    # Encode to a sibling .png temp then os.replace() into place, so a write
+    # failure can never leave this run's output (or a half-written file).
+    tmp_path = os.path.splitext(output_path)[0] + ".part.png"
+    try:
+        if not imwrite_unicode(tmp_path, layer):
+            raise OSError("PNG encode/write returned False")
+        os.replace(tmp_path, output_path)
+    except Exception as save_e:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        update_status(
+            f"Error: Failed to save transparent face layer to {output_path}: {save_e}",
+            NAME,
+        )
+        return False
+
+    update_status(f"Transparent face layer saved to: {output_path}", NAME)
+    return True
+
+
 def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
     """Optimized face swapping with better memory management and performance."""
     face_swapper = get_face_swapper()
@@ -1365,22 +1657,10 @@ def apply_mouth_area(
             return frame
 
         # --- Mask Creation ---
-        # Create a mask based on the mouth_polygon, relative to the ROI
-        polygon_mask_roi = np.zeros(roi.shape[:2], dtype=np.uint8)
-        adjusted_polygon = mouth_polygon - [min_x, min_y]
-        cv2.fillPoly(polygon_mask_roi, [adjusted_polygon.astype(np.int32)], 255)
-
-        # Feather the edges with Gaussian blur for smooth blending
-        feather_amount = max(1, min(30, min(box_width, box_height) // 8))
-        kernel_size = 2 * feather_amount + 1
-        feathered_mask = cv2.GaussianBlur(polygon_mask_roi.astype(np.float32), (kernel_size, kernel_size), 0)
-
-        # Normalize to [0.0, 1.0]
-        max_val = feathered_mask.max()
-        if max_val > 1e-6:
-            feathered_mask = feathered_mask / max_val
-        else:
-            feathered_mask.fill(0.0)
+        # Shared with the transparent face-layer export (_build_mouth_feather_mask)
+        # so the layer's alpha hole and this blend use identical geometry/feather.
+        mouth_keep_full = _build_mouth_feather_mask(frame.shape, mouth_box, mouth_polygon)
+        feathered_mask = mouth_keep_full[min_y:max_y, min_x:max_x]
 
         # --- Blending: paste original mouth onto swapped face ---
         if len(frame.shape) == 3 and frame.shape[2] == 3:

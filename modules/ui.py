@@ -490,6 +490,9 @@ class _Switch(QWidget):
     def setChecked(self, value: bool) -> None:
         self._checkbox.setChecked(value)
 
+    def setToolTip(self, text: str) -> None:
+        self._checkbox.setToolTip(text)
+
 
 class MainWindow(QMainWindow):
     def __init__(self, start_cb: Callable, destroy_cb: Callable):
@@ -537,6 +540,9 @@ class MainWindow(QMainWindow):
         footer.setCursor(Qt.CursorShape.PointingHandCursor)
         footer.mousePressEvent = lambda _e: webbrowser.open("https://deeplivecam.net")
         layout.addWidget(footer)
+
+        # Reflect the restored target/settings on the layer export switch.
+        self._refresh_transparent_layer_switch()
 
     # ── image row ────────────────────────────────────────────────────────
 
@@ -630,19 +636,37 @@ class MainWindow(QMainWindow):
                                     _("Manually assign which source face maps to which target face"))
         self.sw_map_faces.toggled.connect(self._on_map_faces_toggled)
 
+        # Transparent face-layer export (single-face JPEG targets only).
+        self.sw_transparent_layer = _Switch(
+            _("Transparent face layer"),
+            bool(getattr(modules.globals, "transparent_face_layer", False)),
+            _("Export just the swapped face as a transparent PNG the size of "
+              "the JPEG target, ready to composite in an image editor. Requires "
+              "a single-face JPEG target with Many faces, Map faces, Face "
+              "Enhancer and Poisson Blend off and Sharpness at 0."),
+        )
+        self.sw_transparent_layer.toggled.connect(self._on_transparent_layer_toggled)
+        # Availability also depends on settings owned by other controls.
+        self.sw_many_faces.toggled.connect(lambda _v: self._refresh_transparent_layer_switch())
+        self.sw_poisson.toggled.connect(lambda _v: self._refresh_transparent_layer_switch())
+
         # Layout: 2 columns of switches
         items = [
             self.sw_keep_fps, self.sw_keep_audio,
             self.sw_keep_frames, self.sw_many_faces,
             self.sw_map_faces, self.sw_show_fps,
             self.sw_poisson, self.sw_color_fix,
+            self.sw_transparent_layer,
         ]
         for i, w in enumerate(items):
             grid.addWidget(w, i // 2, i % 2)
 
+        # First row after the switch grid, for any number of items.
+        next_row = (len(items) + 1) // 2
+
         # Face enhancer dropdown
         enhancer_label = QLabel(_("Face Enhancer:"))
-        grid.addWidget(enhancer_label, len(items) // 2, 0)
+        grid.addWidget(enhancer_label, next_row, 0)
 
         self.cb_enhancer = QComboBox()
         self.cb_enhancer.addItems(["None", "GFPGAN", "GPEN-512", "GPEN-256"])
@@ -656,7 +680,7 @@ class MainWindow(QMainWindow):
         self.cb_enhancer.setCurrentText(initial)
         self.cb_enhancer.currentTextChanged.connect(self._on_enhancer_change)
         self.cb_enhancer.setToolTip(_("Select a face enhancement model (None = no enhancement)"))
-        grid.addWidget(self.cb_enhancer, len(items) // 2, 1)
+        grid.addWidget(self.cb_enhancer, next_row, 1)
 
         return card
 
@@ -884,6 +908,7 @@ class MainWindow(QMainWindow):
             modules.globals.target_path = None
             self.target_label.clear()
             self.target_label.setText(_("Target"))
+        self._refresh_transparent_layer_switch()
 
     def _on_random_face(self) -> None:
         if _PREVIEW is not None:
@@ -944,6 +969,7 @@ class MainWindow(QMainWindow):
         save_switch_states()
         if not value:
             close_mapper_window()
+        self._refresh_transparent_layer_switch()
 
     def _on_enhancer_change(self, choice: str) -> None:
         key_map = {
@@ -958,6 +984,7 @@ class MainWindow(QMainWindow):
         if selected:
             _update_tumbler(selected, True)
         save_switch_states()
+        self._refresh_transparent_layer_switch()
 
     def _on_transparency_change(self, value: float) -> None:
         modules.globals.opacity = value
@@ -975,6 +1002,40 @@ class MainWindow(QMainWindow):
     def _on_sharpness_change(self, value: float) -> None:
         modules.globals.sharpness = value
         update_status(f"Sharpness set to {value:.1f}")
+        self._refresh_transparent_layer_switch()
+
+    _TRANSPARENT_LAYER_TIP = (
+        "Export just the swapped face as a transparent PNG the size of the "
+        "JPEG target, ready to composite in an image editor. Requires a "
+        "single-face JPEG target with Many faces, Map faces, Face Enhancer "
+        "and Poisson Blend off and Sharpness at 0."
+    )
+
+    def _on_transparent_layer_toggled(self, value: bool) -> None:
+        modules.globals.transparent_face_layer = value
+        if value:
+            update_status(
+                "Transparent face layer on: Start exports a transparent PNG "
+                "of the swapped face."
+            )
+        else:
+            update_status(
+                "Transparent face layer off: Start exports the full composited image."
+            )
+
+    def _refresh_transparent_layer_switch(self) -> None:
+        """Enable the layer switch only in the supported single-face setup."""
+        if not hasattr(self, "sw_transparent_layer"):
+            return
+        from modules.processors.frame.face_swapper import transparent_layer_available
+        available, reason = transparent_layer_available()
+        switch = self.sw_transparent_layer
+        if not available and switch.isChecked():
+            # Programmatic uncheck emits toggled → clears the global.
+            switch.setChecked(False)
+            update_status(_(reason))
+        switch.setEnabled(available)
+        switch.setToolTip(_(reason) if reason else _(self._TRANSPARENT_LAYER_TIP))
 
     def _on_mouth_mask_change(self, value: float) -> None:
         modules.globals.mouth_mask_size = value

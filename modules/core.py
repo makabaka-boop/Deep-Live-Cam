@@ -214,6 +214,40 @@ def update_status(message: str, scope: str = 'DLC.CORE') -> None:
     if not modules.globals.headless:
         ui.update_status(message)
 
+
+def export_transparent_face_layer() -> None:
+    """Desktop image branch: write only the swapped face as a transparent PNG.
+
+    Single-face JPEG targets only; the UI gate (many/map faces, enhancer,
+    Poisson blend and sharpness) is re-checked here as a defensive guard.
+    The output is forced to .png, the target is never copied over first, and
+    on failure no output file is left behind.
+    """
+    from modules.processors.frame import face_swapper
+
+    available, reason = face_swapper.transparent_layer_available()
+    if not available:
+        update_status(reason)
+        return
+
+    # A transparency-capable container regardless of the picked extension.
+    output_root, _output_ext = os.path.splitext(modules.globals.output_path)
+    layer_output_path = output_root + '.png'
+    modules.globals.output_path = layer_output_path
+
+    update_status('Progressing...', face_swapper.NAME)
+    success = face_swapper.process_image_layer(
+        modules.globals.source_path,
+        modules.globals.target_path,
+        layer_output_path,
+    )
+    release_resources()
+    if success:
+        update_status('Processing to image succeed!')
+    else:
+        update_status('Processing to image failed!')
+
+
 def start() -> None:
     """Start processing with performance monitoring."""
     import time
@@ -228,6 +262,9 @@ def start() -> None:
     # process image to image
     if has_image_extension(modules.globals.target_path):
         if modules.globals.nsfw_filter and ui.check_and_ignore_nsfw(modules.globals.target_path, destroy):
+            return
+        if getattr(modules.globals, 'transparent_face_layer', False):
+            export_transparent_face_layer()
             return
         try:
             shutil.copy2(modules.globals.target_path, modules.globals.output_path)

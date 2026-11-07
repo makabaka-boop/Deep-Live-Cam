@@ -1,4 +1,5 @@
 # --- START OF FILE globals.py ---
+from __future__ import annotations
 
 import os
 from typing import List, Dict, Any
@@ -33,6 +34,10 @@ map_faces: bool = False          # Use source_target_map or simple_map for speci
 poisson_blend: bool = False      # Enable Poisson Blending for smoother face swaps
 color_correction: bool = False   # Enable color correction (implementation specific)
 nsfw_filter: bool = False
+# Desktop, single-face JPEG image exports only: write just the swapped face
+# as a same-size transparent PNG layer instead of the full composited image.
+# Always defaults off — the normal export remains the full picture.
+transparent_face_layer: bool = False
 
 # Video Output Options
 video_encoder: str | None = None
