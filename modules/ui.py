@@ -43,6 +43,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMessageBox,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -316,6 +317,7 @@ def render_video_preview(
 def save_switch_states():
     state = {
         "keep_fps": modules.globals.keep_fps,
+        "keep_timing": modules.globals.keep_timing,
         "keep_audio": modules.globals.keep_audio,
         "keep_frames": modules.globals.keep_frames,
         "many_faces": modules.globals.many_faces,
@@ -345,6 +347,7 @@ def load_switch_states():
         with open("switch_states.json", "r") as f:
             state = json.load(f)
         modules.globals.keep_fps = state.get("keep_fps", True)
+        modules.globals.keep_timing = state.get("keep_timing", False)
         modules.globals.keep_audio = state.get("keep_audio", True)
         modules.globals.keep_frames = state.get("keep_frames", False)
         modules.globals.many_faces = state.get("many_faces", False)
@@ -405,6 +408,13 @@ def update_status(text: str) -> None:
         # On UI thread — flush events so the user sees the update during
         # long synchronous start() runs.
         _APP.processEvents()
+
+
+def show_error(message: str, title: str = "Export stopped") -> None:
+    """Modal error dialog (headless runs only log the message)."""
+    print(f"[DLC.UI] {title}: {message}")
+    if _MAIN is not None and _APP is not None:
+        QMessageBox.warning(_MAIN, _(title), message)
 
 
 def check_and_ignore_nsfw(target, destroy: Optional[Callable] = None) -> bool:
@@ -612,6 +622,11 @@ class MainWindow(QMainWindow):
 
         self.sw_keep_fps = make("keep_fps", "Keep fps",
                                 "Output video keeps the original frame rate")
+        self.sw_keep_timing = make(
+            "keep_timing",
+            "Preserve timing",
+            "Keep every frame at its original time for variable-frame-rate phone videos, including the last frame hold. Requires a single-video-track MP4 and is unavailable with Map faces.",
+        )
         self.sw_keep_audio = make("keep_audio", "Keep audio",
                                   "Copy audio track from the source video to output")
         self.sw_keep_frames = make("keep_frames", "Keep frames",
@@ -630,19 +645,25 @@ class MainWindow(QMainWindow):
                                     _("Manually assign which source face maps to which target face"))
         self.sw_map_faces.toggled.connect(self._on_map_faces_toggled)
 
+        # Preserve timing only applies to the non-mapped single-video-track
+        # MP4 pipeline, so it is locked while Map faces is enabled.
+        self.sw_keep_timing.setEnabled(not modules.globals.map_faces)
+
         # Layout: 2 columns of switches
         items = [
-            self.sw_keep_fps, self.sw_keep_audio,
-            self.sw_keep_frames, self.sw_many_faces,
-            self.sw_map_faces, self.sw_show_fps,
-            self.sw_poisson, self.sw_color_fix,
+            self.sw_keep_fps, self.sw_keep_timing,
+            self.sw_keep_audio, self.sw_keep_frames,
+            self.sw_many_faces, self.sw_poisson,
+            self.sw_color_fix, self.sw_show_fps,
+            self.sw_map_faces,
         ]
         for i, w in enumerate(items):
             grid.addWidget(w, i // 2, i % 2)
 
         # Face enhancer dropdown
+        enhancer_row = (len(items) + 1) // 2
         enhancer_label = QLabel(_("Face Enhancer:"))
-        grid.addWidget(enhancer_label, len(items) // 2, 0)
+        grid.addWidget(enhancer_label, enhancer_row, 0)
 
         self.cb_enhancer = QComboBox()
         self.cb_enhancer.addItems(["None", "GFPGAN", "GPEN-512", "GPEN-256"])
@@ -656,7 +677,7 @@ class MainWindow(QMainWindow):
         self.cb_enhancer.setCurrentText(initial)
         self.cb_enhancer.currentTextChanged.connect(self._on_enhancer_change)
         self.cb_enhancer.setToolTip(_("Select a face enhancement model (None = no enhancement)"))
-        grid.addWidget(self.cb_enhancer, len(items) // 2, 1)
+        grid.addWidget(self.cb_enhancer, enhancer_row, 1)
 
         return card
 
@@ -942,6 +963,10 @@ class MainWindow(QMainWindow):
     def _on_map_faces_toggled(self, value: bool) -> None:
         modules.globals.map_faces = value
         save_switch_states()
+        # Preserve timing supports the simple single-video-track pipeline only.
+        self.sw_keep_timing.setEnabled(not value)
+        if value and self.sw_keep_timing.isChecked():
+            self.sw_keep_timing.setChecked(False)
         if not value:
             close_mapper_window()
 

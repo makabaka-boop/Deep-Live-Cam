@@ -11,6 +11,7 @@ import platform
 import signal
 import shutil
 import argparse
+import time
 try:
     import torch
     HAS_TORCH = True
@@ -27,7 +28,7 @@ import modules.globals
 import modules.metadata
 import modules.ui as ui
 from modules.processors.frame.core import get_frame_processors_modules, process_video_in_memory
-from modules.utilities import has_image_extension, is_image, is_video, detect_fps, create_video, extract_frames, get_temp_frame_paths, restore_audio, create_temp, move_temp, clean_temp, normalize_output_path
+from modules.utilities import has_image_extension, is_image, is_video, detect_fps, create_video, create_video_vfr, probe_video_timing, verify_video_timing, restore_audio, restore_audio_timed, extract_frames, get_temp_frame_paths, get_temp_output_path, create_temp, move_temp, clean_temp, normalize_output_path
 
 if HAS_TORCH and 'ROCMExecutionProvider' in modules.globals.execution_providers:
     del torch
@@ -45,6 +46,7 @@ def parse_args() -> None:
     program.add_argument('-o', '--output', help='select output file or directory', dest='output_path')
     program.add_argument('--frame-processor', help='pipeline of frame processors', dest='frame_processor', default=['face_swapper'], choices=['face_swapper', 'face_enhancer', 'face_enhancer_gpen256', 'face_enhancer_gpen512'], nargs='+')
     program.add_argument('--keep-fps', help='keep original fps', dest='keep_fps', action='store_true', default=False)
+    program.add_argument('--keep-timing', help='preserve original per-frame playback timing (variable frame rate mp4)', dest='keep_timing', action='store_true', default=False)
     program.add_argument('--keep-audio', help='keep original audio', dest='keep_audio', action='store_true', default=True)
     program.add_argument('--keep-frames', help='keep temporary frames', dest='keep_frames', action='store_true', default=False)
     program.add_argument('--many-faces', help='process every face', dest='many_faces', action='store_true', default=False)
@@ -76,6 +78,7 @@ def parse_args() -> None:
     modules.globals.frame_processors = args.frame_processor
     modules.globals.headless = args.source_path or args.target_path or args.output_path
     modules.globals.keep_fps = args.keep_fps
+    modules.globals.keep_timing = args.keep_timing
     modules.globals.keep_audio = args.keep_audio
     modules.globals.keep_frames = args.keep_frames
     modules.globals.many_faces = args.many_faces
@@ -214,6 +217,118 @@ def update_status(message: str, scope: str = 'DLC.CORE') -> None:
     if not modules.globals.headless:
         ui.update_status(message)
 
+def _frame_path_index(frame_path: str) -> int:
+    try:
+        return int(os.path.splitext(os.path.basename(frame_path))[0])
+    except ValueError:
+        return 0
+
+
+def _abort_timed_export(message: str, target_path: str = None, output_created: bool = False) -> None:
+    """Report why the timing-preserving export stopped, without leaving an output."""
+    update_status(message)
+    ui.show_error(message)
+    if target_path:
+        clean_temp(target_path)
+    if output_created and modules.globals.output_path and os.path.isfile(modules.globals.output_path):
+        try:
+            os.remove(modules.globals.output_path)
+        except OSError as error:
+            print(f"[DLC.CORE] Could not remove incomplete output: {error}")
+
+
+def process_video_with_original_timing(start_time: float) -> None:
+    """Export a single-video-track MP4 keeping every frame's original timing.
+
+    Unlike the constant-frame-rate pipelines, each processed frame is placed at
+    the presentation time recorded in the source, and the last frame keeps its
+    original hold time. Any uncertainty about the source timing, or a mismatch
+    between timing data and processed frames, aborts the export - no output file
+    is produced.
+    """
+    target_path = modules.globals.target_path
+
+    if modules.globals.map_faces:
+        _abort_timed_export('Preserve timing is unavailable when "Map faces" is enabled.')
+        return
+    if os.path.splitext(target_path)[1].lower() != '.mp4':
+        _abort_timed_export('Preserve timing only supports single-video-track MP4 files.')
+        return
+
+    update_status('Reading original frame timing...')
+    timing, reason = probe_video_timing(target_path)
+    if timing is None:
+        _abort_timed_export(f'Cannot preserve the original timing: {reason} Export stopped, no output was created.')
+        return
+
+    update_status(
+        f'Original timing: {len(timing.durations)} frames over {timing.duration:.3f}s '
+        f'(variable frame rate).'
+    )
+
+    create_temp(target_path)
+    update_status('Extracting frames...')
+    extract_frames(target_path)
+
+    temp_frame_paths = sorted(get_temp_frame_paths(target_path), key=_frame_path_index)
+    if len(temp_frame_paths) != len(timing.durations):
+        _abort_timed_export(
+            f'Processed frame count ({len(temp_frame_paths)}) does not line up with the '
+            f'original timing ({len(timing.durations)} frames). Export stopped, no output was created.',
+            target_path,
+        )
+        return
+
+    total_frames = len(temp_frame_paths)
+    update_status(f'Processing {total_frames} frames with {modules.globals.execution_threads} threads...')
+    for frame_processor in get_frame_processors_modules(modules.globals.frame_processors):
+        update_status('Progressing...', frame_processor.NAME)
+        frame_processor.process_video(modules.globals.source_path, temp_frame_paths)
+        release_resources()
+
+    update_status('Encoding video with the original per-frame timing...')
+    if not create_video_vfr(target_path, timing.durations):
+        _abort_timed_export(
+            'Failed to encode the video with the original timing. Export stopped, no output was created.',
+            target_path,
+        )
+        return
+
+    mismatch = verify_video_timing(
+        get_temp_output_path(target_path),
+        total_frames,
+        timing.duration,
+    )
+    if mismatch:
+        _abort_timed_export(
+            f'The encoded timing does not match the source: {mismatch} Export stopped, no output was created.',
+            target_path,
+        )
+        return
+
+    if modules.globals.keep_audio and timing.has_audio:
+        update_status('Restoring audio with preserved timing...')
+        if not restore_audio_timed(target_path, modules.globals.output_path):
+            _abort_timed_export(
+                'Failed to mux the original audio in sync. Export stopped, no output was created.',
+                target_path,
+                output_created=True,
+            )
+            return
+    else:
+        if modules.globals.keep_audio:
+            update_status('The source has no audio track; exporting without audio.')
+        move_temp(target_path, modules.globals.output_path)
+
+    clean_temp(target_path)
+
+    total_time = time.time() - start_time
+    if os.path.isfile(modules.globals.output_path):
+        update_status(f'Video processing succeeded with original timing! Total time: {total_time:.2f}s')
+    else:
+        update_status('Processing to video failed!')
+
+
 def start() -> None:
     """Start processing with performance monitoring."""
     import time
@@ -246,6 +361,12 @@ def start() -> None:
     
     # process image to videos
     if modules.globals.nsfw_filter and ui.check_and_ignore_nsfw(modules.globals.target_path, destroy):
+        return
+
+    # Preserve the source per-frame timing (variable frame rate MP4): use the
+    # fidelity-first disk pipeline with explicit per-frame timestamps.
+    if modules.globals.keep_timing:
+        process_video_with_original_timing(start_time)
         return
 
     # Detect FPS early (needed by both pipelines)

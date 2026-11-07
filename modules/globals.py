@@ -27,6 +27,10 @@ output_path: str | None = None
 frame_processors: List[str] = []
 keep_fps: bool = True
 keep_audio: bool = True
+# Preserve the source video's per-frame presentation times (for variable
+# frame-rate MP4s from phones). Off by default; the constant-fps export path
+# is used when disabled.
+keep_timing: bool = False
 keep_frames: bool = False
 many_faces: bool = False         # Process all detected faces with default source
 map_faces: bool = False          # Use source_target_map or simple_map for specific swaps

@@ -44,6 +44,7 @@ def _patched_core_import_stubs(calls, pipe_result=False):
         "modules.ui": types.SimpleNamespace(
             check_and_ignore_nsfw=lambda *_args, **_kwargs: False,
             update_status=lambda *_args, **_kwargs: None,
+            show_error=lambda *_args, **_kwargs: None,
             init=lambda *_args, **_kwargs: types.SimpleNamespace(mainloop=lambda: None),
         ),
         "modules.processors.frame.core": types.SimpleNamespace(
@@ -64,7 +65,12 @@ def _patched_core_import_stubs(calls, pipe_result=False):
                 ("extract_frames", target_path)
             ),
             get_temp_frame_paths=lambda target_path: [f"{target_path}/0001.png"],
+            get_temp_output_path=lambda target_path: f"{target_path}/temp/temp.mp4",
             restore_audio=lambda *_args, **_kwargs: calls.append(("restore_audio",)),
+            restore_audio_timed=lambda *_args, **_kwargs: True,
+            probe_video_timing=lambda *_args, **_kwargs: (None, "stubbed"),
+            verify_video_timing=lambda *_args, **_kwargs: None,
+            create_video_vfr=lambda *_args, **_kwargs: False,
             create_temp=lambda target_path: calls.append(("create_temp", target_path)),
             move_temp=lambda target_path, output_path: calls.append(
                 ("move_temp", target_path, output_path)
@@ -86,6 +92,7 @@ def _configure_video_run(core, *, map_faces):
     core.modules.globals.frame_processors = ["face_swapper"]
     core.modules.globals.headless = True
     core.modules.globals.keep_fps = False
+    core.modules.globals.keep_timing = False
     core.modules.globals.keep_audio = False
     core.modules.globals.keep_frames = False
     core.modules.globals.map_faces = map_faces
