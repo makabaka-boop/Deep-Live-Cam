@@ -1,11 +1,12 @@
 import glob
+import json
 import mimetypes
 import os
 import shutil
 import subprocess
 import urllib
 from pathlib import Path
-from typing import List, Any
+from typing import List, Any, Optional, Tuple
 from tqdm import tqdm
 
 import modules.globals
@@ -353,3 +354,199 @@ def estimate_frame_count(target_path: str, fps: float = None) -> int:
         return int(duration * fps)
     except Exception:
         return 0
+
+
+# ─── face swap frame range ────────────────────────────────────────────────
+
+# Stable, whole-string status keys for invalid ranges. UI translations key on
+# these exact strings; keep them static (no interpolated numbers) so gettext
+# can resolve them.
+FACE_SWAP_RANGE_INELIGIBLE = (
+    "Face swap range requires a constant-frame-rate MP4 with a single video track."
+)
+FACE_SWAP_RANGE_INCOMPLETE = (
+    "Please mark both the start frame and the end frame, "
+    "or clear the marks to process the whole video."
+)
+FACE_SWAP_RANGE_REVERSED = "The start frame cannot be later than the end frame."
+FACE_SWAP_RANGE_FRAME_NOT_FOUND = (
+    "A frame marked for the face swap range cannot be found in the target video."
+)
+
+
+def probe_video_streams(target_path: str) -> List[dict]:
+    """Return every video stream's ffprobe metadata as a list of dicts."""
+    command = [
+        "ffprobe", "-v", "error",
+        "-show_streams",
+        "-of", "json",
+        target_path,
+    ]
+    output = subprocess.check_output(command).decode("utf-8")
+    data = json.loads(output)
+    return [
+        stream
+        for stream in data.get("streams", [])
+        if stream.get("codec_type") == "video"
+    ]
+
+
+def _parse_frame_rate(value: Any) -> Optional[float]:
+    """Parse ffprobe rate strings ('30000/1001', '30') into a float."""
+    if not value or not isinstance(value, str):
+        return None
+    try:
+        if "/" in value:
+            numerator, denominator = value.split("/", 1)
+            denominator = float(denominator)
+            if denominator == 0:
+                return None
+            return float(numerator) / denominator
+        return float(value)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
+def is_face_swap_range_supported(target_path: str) -> bool:
+    """True only for an .mp4 container with exactly one constant-frame-rate
+    video stream. Frame indices marked by the UI only line up with the
+    sequential frame order used by both export pipelines under these
+    conditions."""
+    if not target_path or os.path.splitext(target_path)[1].lower() != ".mp4":
+        return False
+    try:
+        streams = probe_video_streams(target_path)
+    except Exception:
+        return False
+    if len(streams) != 1:
+        return False
+    stream = streams[0]
+    real_rate = _parse_frame_rate(stream.get("r_frame_rate"))
+    average_rate = _parse_frame_rate(stream.get("avg_frame_rate"))
+    if real_rate is None or average_rate is None or average_rate <= 0:
+        return False
+    # ffprobe reports equal real/average rates for constant frame rate.
+    return abs(real_rate - average_rate) < 1e-6
+
+
+def get_video_frame_count(target_path: str) -> Optional[int]:
+    """Authoritative frame count of the first video stream.
+
+    MP4 containers expose the sample count directly via nb_frames; fall back
+    to packet counting (still container-only, no decode) when it is absent.
+    """
+    commands = [
+        [
+            "ffprobe", "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=nb_frames",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            target_path,
+        ],
+        [
+            "ffprobe", "-v", "error",
+            "-select_streams", "v:0",
+            "-count_packets",
+            "-show_entries", "stream=nb_read_packets",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            target_path,
+        ],
+    ]
+    for command in commands:
+        try:
+            output = subprocess.check_output(command).decode("utf-8").strip()
+            if output and output != "N/A":
+                count = int(output)
+                if count > 0:
+                    return count
+        except (subprocess.CalledProcessError, OSError, ValueError):
+            continue
+    return None
+
+
+def frame_index_in_face_swap_range(
+    index: int, start: Optional[int], end: Optional[int]
+) -> bool:
+    """Inclusive [start, end] test. Unset bounds mean 'process everything'."""
+    if start is None or end is None:
+        return True
+    return start <= index <= end
+
+
+def preview_position_to_frame_index(position: int) -> int:
+    """Map a preview slider position to the 0-based decode index of the frame
+    capturer.get_video_frame actually displays. Positions 0 and 1 both show
+    the first frame; position N (N >= 2) shows decode index N - 1."""
+    return 0 if position <= 1 else position - 1
+
+
+def get_active_face_swap_range(
+    target_path: str,
+) -> Tuple[Optional[int], Optional[int]]:
+    """Return the (start, end) marks that apply to target_path.
+
+    Marks belong to the target they were taken from; marks left behind by a
+    changed target are ignored rather than silently applied."""
+    start = modules.globals.face_swap_start_frame
+    end = modules.globals.face_swap_end_frame
+    if start is None and end is None:
+        return None, None
+    if modules.globals.face_swap_range_target != target_path:
+        return None, None
+    return start, end
+
+
+def validate_face_swap_range(
+    target_path: str,
+    start: Optional[int],
+    end: Optional[int],
+) -> Optional[str]:
+    """Return a translatable error reason when the marked range cannot be
+    exported, or None when processing should proceed.
+
+    No marks (whole video) always passes. Otherwise reject:
+      * target that is not a CFR single-video-track MP4,
+      * only one end marked,
+      * start later than end (or a negative index),
+      * an end frame beyond the video's actual frame count.
+    """
+    if start is None and end is None:
+        return None
+    if not is_face_swap_range_supported(target_path):
+        return FACE_SWAP_RANGE_INELIGIBLE
+    if (start is None) != (end is None):
+        return FACE_SWAP_RANGE_INCOMPLETE
+    if start < 0 or end < 0 or start > end:
+        return FACE_SWAP_RANGE_REVERSED
+    total_frames = get_video_frame_count(target_path)
+    if total_frames is None or end >= total_frames or start >= total_frames:
+        return FACE_SWAP_RANGE_FRAME_NOT_FOUND
+    return None
+
+
+def select_temp_frames_in_range(
+    temp_frame_paths: List[str],
+    start: Optional[int],
+    end: Optional[int],
+) -> List[str]:
+    """Sort extracted '%04d.png' frame files (1-based names) and keep those
+    whose 0-based decode index lies in the inclusive [start, end].
+
+    Frames outside the range are left untouched on disk, so the encoding
+    step reassembles every frame in its original order. Both bounds unset
+    returns the full, deterministically ordered list."""
+    ordered = sorted(temp_frame_paths)
+    if start is None or end is None:
+        return ordered
+    selected: List[str] = []
+    for path in ordered:
+        name = os.path.splitext(os.path.basename(path))[0]
+        if not name.isdigit():
+            # Extraction always writes %04d.png; process anything unexpected
+            # rather than silently leaving it unswapped.
+            selected.append(path)
+            continue
+        index = int(name) - 1  # extraction starts at 0001 for frame 0
+        if start <= index <= end:
+            selected.append(path)
+    return selected

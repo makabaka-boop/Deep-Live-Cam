@@ -1,7 +1,7 @@
 # --- START OF FILE globals.py ---
 
 import os
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 WORKFLOW_DIR = os.path.join(ROOT_DIR, "workflow")
@@ -37,6 +37,16 @@ nsfw_filter: bool = False
 # Video Output Options
 video_encoder: str | None = None
 video_quality: int | None = None # Typically a CRF value or bitrate
+
+# Face swap frame range (desktop UI only). 0-based, inclusive frame indices
+# into the target video's decode order; both None means the whole video is
+# processed. Only honored for constant-frame-rate, single-video-track MP4
+# targets while map_faces is disabled. face_swap_range_target records the
+# target path the marks were taken from so a changed target never reuses
+# stale marks.
+face_swap_start_frame: Optional[int] = None
+face_swap_end_frame: Optional[int] = None
+face_swap_range_target: Optional[str] = None
 
 # Live Mode Options
 live_mirror: bool = False

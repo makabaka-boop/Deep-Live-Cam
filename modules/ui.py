@@ -43,6 +43,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMessageBox,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -73,6 +74,11 @@ from modules.utilities import (
     has_image_extension,
     is_image,
     is_video,
+    get_active_face_swap_range,
+    is_face_swap_range_supported,
+    preview_position_to_frame_index,
+    validate_face_swap_range,
+    FACE_SWAP_RANGE_REVERSED,
 )
 from modules import imread_unicode
 from modules.video_capture import VideoCapturer
@@ -234,6 +240,15 @@ def _(text: str) -> str:
     if _LANG is None:
         return text
     return _LANG._(text)
+
+
+def clear_face_swap_range() -> None:
+    """Drop every face swap range mark. Called when the target material
+    changes or map_faces is enabled, so old marks can never apply to a
+    different video."""
+    modules.globals.face_swap_start_frame = None
+    modules.globals.face_swap_end_frame = None
+    modules.globals.face_swap_range_target = None
 
 
 # Preserve original cwd state for file dialogs.
@@ -868,6 +883,9 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
+        # New target material invalidates any frame marks taken from the
+        # previous video.
+        clear_face_swap_range()
         if is_image(path):
             modules.globals.target_path = path
             _RECENT_TARGET_DIR = os.path.dirname(path)
@@ -942,6 +960,10 @@ class MainWindow(QMainWindow):
     def _on_map_faces_toggled(self, value: bool) -> None:
         modules.globals.map_faces = value
         save_switch_states()
+        if value:
+            # The frame range feature is only available without face mapping;
+            # marks must not survive into a map_faces export.
+            clear_face_swap_range()
         if not value:
             close_mapper_window()
 
@@ -1017,6 +1039,21 @@ class MainWindow(QMainWindow):
                 _IMAGE_FILE_FILTER,
             )
         elif is_video(modules.globals.target_path):
+            # Stop this export before asking for an output file when the
+            # marked face swap range cannot be used.
+            if not modules.globals.map_faces:
+                range_start, range_end = get_active_face_swap_range(
+                    modules.globals.target_path
+                )
+                range_error = validate_face_swap_range(
+                    modules.globals.target_path, range_start, range_end
+                )
+                if range_error:
+                    update_status(range_error)
+                    QMessageBox.warning(
+                        self, _("Cannot start export"), _(range_error)
+                    )
+                    return
             path, _f = QFileDialog.getSaveFileName(
                 self, _("save video output file"),
                 os.path.join(_RECENT_OUTPUT_DIR or "", "output.mp4"),
@@ -1087,6 +1124,7 @@ class PreviewWindow(QWidget):
         self.resize(PREVIEW_DEFAULT_WIDTH, PREVIEW_DEFAULT_HEIGHT)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
 
         self._image_label = QLabel()
         self._image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1098,14 +1136,118 @@ class PreviewWindow(QWidget):
         self._slider.valueChanged.connect(self.refresh_frame)
         layout.addWidget(self._slider)
 
+        # Face swap range controls. Only shown for eligible targets
+        # (constant-frame-rate, single-video-track MP4, map_faces off).
+        self._range_supported = False
+        self._range_bar = QWidget()
+        range_layout = QVBoxLayout(self._range_bar)
+        range_layout.setContentsMargins(10, 2, 10, 8)
+        range_layout.setSpacing(6)
+
+        button_row = QHBoxLayout()
+        button_row.setSpacing(8)
+        self._btn_mark_start = QPushButton(_("Mark start frame"))
+        self._btn_mark_start.setToolTip(
+            _("Use the frame currently shown in the preview as the first "
+              "face-swapped frame (included in the range)")
+        )
+        self._btn_mark_start.clicked.connect(self._on_mark_start)
+        self._btn_mark_end = QPushButton(_("Mark end frame"))
+        self._btn_mark_end.setToolTip(
+            _("Use the frame currently shown in the preview as the last "
+              "face-swapped frame (included in the range)")
+        )
+        self._btn_mark_end.clicked.connect(self._on_mark_end)
+        self._btn_clear_range = QPushButton(_("Clear range"))
+        self._btn_clear_range.setObjectName("secondary")
+        self._btn_clear_range.setToolTip(
+            _("Remove both marks and process the whole video")
+        )
+        self._btn_clear_range.clicked.connect(self._on_clear_range)
+        button_row.addWidget(self._btn_mark_start)
+        button_row.addWidget(self._btn_mark_end)
+        button_row.addWidget(self._btn_clear_range)
+        range_layout.addLayout(button_row)
+
+        self._range_label = QLabel("")
+        self._range_label.setObjectName("statusLabel")
+        self._range_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        range_layout.addWidget(self._range_label)
+
+        self._range_bar.hide()
+        layout.addWidget(self._range_bar)
+
     def init_for_target(self) -> None:
         if is_image(modules.globals.target_path):
             self._slider.hide()
+            self._range_bar.hide()
+            self._range_supported = False
         elif is_video(modules.globals.target_path):
             total = get_video_frame_total(modules.globals.target_path)
             self._slider.setRange(0, max(0, total - 1))
             self._slider.setValue(0)
             self._slider.show()
+            # Range marking requires frame indices that line up exactly with
+            # export order: CFR MP4 with a single video track and no face
+            # mapping (which uses its own disk pipeline).
+            self._range_supported = (
+                not modules.globals.map_faces
+                and is_face_swap_range_supported(modules.globals.target_path)
+            )
+            if self._range_supported:
+                self._range_bar.show()
+                self._update_range_label()
+            else:
+                self._range_bar.hide()
+
+    def _current_frame_index(self) -> int:
+        return preview_position_to_frame_index(self._slider.value())
+
+    def _on_mark_start(self) -> None:
+        index = self._current_frame_index()
+        modules.globals.face_swap_start_frame = index
+        modules.globals.face_swap_range_target = modules.globals.target_path
+        self._update_range_label()
+        self.refresh_frame(self._slider.value())
+        update_status(_("Start frame marked:") + f" {index + 1}")
+
+    def _on_mark_end(self) -> None:
+        index = self._current_frame_index()
+        modules.globals.face_swap_end_frame = index
+        modules.globals.face_swap_range_target = modules.globals.target_path
+        self._update_range_label()
+        self.refresh_frame(self._slider.value())
+        update_status(_("End frame marked:") + f" {index + 1}")
+
+    def _on_clear_range(self) -> None:
+        clear_face_swap_range()
+        self._update_range_label()
+        self.refresh_frame(self._slider.value())
+        update_status(_("Face swap range cleared - processing the whole video."))
+
+    def _update_range_label(self) -> None:
+        if not self._range_supported:
+            return
+        start, end = get_active_face_swap_range(modules.globals.target_path)
+        current = self._current_frame_index() + 1
+        start_text = str(start + 1) if start is not None else "--"
+        end_text = str(end + 1) if end is not None else "--"
+        self._range_label.setText(
+            _("Current frame:") + f" {current}    "
+            + _("Start frame:") + f" {start_text}    "
+            + _("End frame:") + f" {end_text}"
+        )
+        reversed_order = start is not None and end is not None and start > end
+        if reversed_order:
+            self._range_label.setStyleSheet("color: #e5736b;")
+            self._range_label.setToolTip(_(FACE_SWAP_RANGE_REVERSED))
+        else:
+            self._range_label.setStyleSheet("")
+            self._range_label.setToolTip(_(
+                "Only frames between the marked start and end (both "
+                "included) are face-swapped and enhanced; other frames "
+                "keep their original look."
+            ))
 
     def refresh_frame(self, frame_number: int = 0) -> None:
         if not (modules.globals.source_path and modules.globals.target_path):
@@ -1114,15 +1256,32 @@ class PreviewWindow(QWidget):
         temp_frame = get_video_frame(modules.globals.target_path, frame_number)
         if modules.globals.nsfw_filter and check_and_ignore_nsfw(temp_frame):
             return
-        source_frame = imread_unicode(modules.globals.source_path)
-        if source_frame is None:
-            update_status(
-                f"Could not read source image: {modules.globals.source_path}"
-            )
-            return
-        from modules.processors.frame.core import get_frame_processors_modules as _gfpm
-        for fp in _gfpm(modules.globals.frame_processors):
-            temp_frame = fp.process_frame(get_one_face(source_frame), temp_frame)
+
+        # Only frames inside the marked range are swapped/enhanced in the
+        # preview. A half-marked range behaves like the whole video until the
+        # other end is set; export rejects that state instead.
+        apply_processors = True
+        if self._range_supported and is_video(modules.globals.target_path):
+            frame_index = preview_position_to_frame_index(frame_number)
+            start, end = get_active_face_swap_range(modules.globals.target_path)
+            if (
+                start is not None
+                and end is not None
+                and not start <= frame_index <= end
+            ):
+                apply_processors = False
+
+        if apply_processors:
+            source_frame = imread_unicode(modules.globals.source_path)
+            if source_frame is None:
+                update_status(
+                    f"Could not read source image: {modules.globals.source_path}"
+                )
+                return
+            from modules.processors.frame.core import get_frame_processors_modules as _gfpm
+            for fp in _gfpm(modules.globals.frame_processors):
+                temp_frame = fp.process_frame(get_one_face(source_frame), temp_frame)
+
         # Fit to current widget size while preserving aspect ratio.
         h, w = temp_frame.shape[:2]
         bound_w = min(PREVIEW_MAX_WIDTH, max(self.width(), PREVIEW_DEFAULT_WIDTH))
@@ -1131,7 +1290,13 @@ class PreviewWindow(QWidget):
         new_size = (max(1, int(w * ratio)), max(1, int(h * ratio)))
         temp_frame = cv2.resize(temp_frame, new_size, interpolation=cv2.INTER_LANCZOS4)
         self._image_label.setPixmap(_bgr_to_qpixmap(temp_frame))
-        update_status("Processing succeed!")
+        if apply_processors:
+            update_status("Processing succeed!")
+        else:
+            update_status(
+                _("Outside the face swap range - original frame shown.")
+            )
+        self._update_range_label()
 
 
 # ─── webcam preview window ───────────────────────────────────────────────

@@ -4,7 +4,7 @@ import sys
 import importlib
 from concurrent.futures import ThreadPoolExecutor
 from types import ModuleType
-from typing import Any, List, Callable
+from typing import Any, List, Callable, Optional
 
 import numpy as np
 from tqdm import tqdm
@@ -132,6 +132,7 @@ def process_video_in_memory(source_path: str, target_path: str, fps: float) -> b
         get_video_dimensions,
         estimate_frame_count,
         get_temp_output_path,
+        get_active_face_swap_range,
     )
 
     temp_output_path = get_temp_output_path(target_path)
@@ -162,6 +163,14 @@ def process_video_in_memory(source_path: str, target_path: str, fps: float) -> b
 
     total_frames = estimate_frame_count(target_path, fps)
     frame_size = width * height * 3
+
+    # Face swap range (0-based, inclusive). Only marks bound to this exact
+    # target are honored. The same bounds are reused on every encoder attempt,
+    # so a hardware -> software encoder fallback keeps the same frame range.
+    swap_start, swap_end = get_active_face_swap_range(target_path)
+    if swap_start is not None and swap_end is not None:
+        print(f"[DLC.CORE] Face swap range: frames "
+              f"{swap_start + 1}-{swap_end + 1} (inclusive) of {target_path}")
 
     # --- Build encoder arguments ---
     encoder = modules.globals.video_encoder
@@ -244,6 +253,7 @@ def process_video_in_memory(source_path: str, target_path: str, fps: float) -> b
             source_face, frame_processors,
             width, height, frame_size, total_frames,
             enc, enc_opts,
+            swap_start, swap_end,
         )
         if success:
             return True
@@ -267,8 +277,16 @@ def _run_pipe_pipeline(
     total_frames: int,
     encoder: str,
     encoder_options: List[str],
+    swap_start: Optional[int] = None,
+    swap_end: Optional[int] = None,
 ) -> bool:
-    """Run the FFmpeg-pipe read → process → encode pipeline once."""
+    """Run the FFmpeg-pipe read → process → encode pipeline once.
+
+    Frames outside the inclusive [swap_start, swap_end] range are written to
+    the encoder untouched (no detection, no swap, no enhancement), while all
+    frames are still read and written in order.
+    """
+    from modules.utilities import frame_index_in_face_swap_range
 
     # --- Reader: decode source video to raw BGR24 on stdout ---
     reader_cmd = [
@@ -339,6 +357,7 @@ def _run_pipe_pipeline(
             detect_executor = ThreadPoolExecutor(max_workers=1)
             pending_detect = None
             use_pipeline = not modules.globals.many_faces
+            frame_index = 0
 
             while True:
                 raw = reader.stdout.read(frame_size)
@@ -349,33 +368,46 @@ def _run_pipe_pipeline(
                     (height, width, 3)
                 ).copy()
 
-                # Get the detection result for THIS frame
-                if use_pipeline:
-                    if pending_detect is not None:
-                        target_face = pending_detect.result()
+                if frame_index_in_face_swap_range(
+                    frame_index, swap_start, swap_end
+                ):
+                    # Get the detection result for THIS frame
+                    if use_pipeline:
+                        if pending_detect is not None:
+                            target_face = pending_detect.result()
+                        else:
+                            target_face = get_one_face(frame)
+                        # Start detecting on THIS frame eagerly — the result
+                        # will be used for the next iteration.  At video
+                        # frame rates the face barely moves between frames.
+                        # Hand the detector its own copy: the frame processors
+                        # below mutate `frame` in place (paste-back), which
+                        # would otherwise race with detection.
+                        pending_detect = detect_executor.submit(
+                            get_one_face, frame.copy())
                     else:
-                        target_face = get_one_face(frame)
-                    # Start detecting on THIS frame eagerly — the result
-                    # will be used for the next iteration.  At video
-                    # frame rates the face barely moves between frames.
-                    # Hand the detector its own copy: the frame processors
-                    # below mutate `frame` in place (paste-back), which
-                    # would otherwise race with detection.
-                    pending_detect = detect_executor.submit(
-                        get_one_face, frame.copy())
-                else:
-                    target_face = None
+                        target_face = None
 
-                # Run frame through every active processor
-                for fp in frame_processors:
-                    try:
-                        frame = fp.process_frame(source_face, frame, target_face=target_face)
-                    except TypeError:
-                        frame = fp.process_frame(source_face, frame)
+                    # Run frame through every active processor
+                    for fp in frame_processors:
+                        try:
+                            frame = fp.process_frame(source_face, frame, target_face=target_face)
+                        except TypeError:
+                            frame = fp.process_frame(source_face, frame)
+                else:
+                    # Outside the marked range: keep the original frame. Any
+                    # face detected on the previous frame is drained and
+                    # discarded so it can never be pasted onto this frame,
+                    # and re-entering the range starts from a fresh, in-range
+                    # detection.
+                    if pending_detect is not None:
+                        pending_detect.result()
+                    pending_detect = None
 
                 writer.stdin.write(frame.tobytes())
                 processed_count += 1
                 progress.update(1)
+                frame_index += 1
 
             detect_executor.shutdown(wait=True)
 

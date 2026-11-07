@@ -71,6 +71,9 @@ def _patched_core_import_stubs(calls, pipe_result=False):
             ),
             clean_temp=lambda target_path: calls.append(("clean_temp", target_path)),
             normalize_output_path=lambda _source, _target, output: output,
+            validate_face_swap_range=lambda *_args, **_kwargs: None,
+            get_active_face_swap_range=lambda *_args, **_kwargs: (None, None),
+            select_temp_frames_in_range=lambda paths, *_args, **_kwargs: sorted(paths),
         ),
     }
     with patch.dict(sys.modules, stubs, clear=False):

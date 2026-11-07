@@ -27,7 +27,7 @@ import modules.globals
 import modules.metadata
 import modules.ui as ui
 from modules.processors.frame.core import get_frame_processors_modules, process_video_in_memory
-from modules.utilities import has_image_extension, is_image, is_video, detect_fps, create_video, extract_frames, get_temp_frame_paths, restore_audio, create_temp, move_temp, clean_temp, normalize_output_path
+from modules.utilities import has_image_extension, is_image, is_video, detect_fps, create_video, extract_frames, get_temp_frame_paths, restore_audio, create_temp, move_temp, clean_temp, normalize_output_path, validate_face_swap_range, get_active_face_swap_range, select_temp_frames_in_range
 
 if HAS_TORCH and 'ROCMExecutionProvider' in modules.globals.execution_providers:
     del torch
@@ -255,6 +255,20 @@ def start() -> None:
     else:
         fps = 30.0
 
+    # Validate the marked face swap range before touching the target. A
+    # partial/reversed range or a mark that cannot be resolved to a frame
+    # aborts this export with a reason; nothing is extracted or encoded.
+    # map_faces has its own disk pipeline and does not support ranges.
+    range_start = range_end = None
+    if not modules.globals.map_faces:
+        range_start, range_end = get_active_face_swap_range(modules.globals.target_path)
+        range_error = validate_face_swap_range(
+            modules.globals.target_path, range_start, range_end
+        )
+        if range_error:
+            update_status(range_error)
+            return
+
     video_created = False
 
     # --- In-memory pipeline (non-map_faces only) ---
@@ -289,7 +303,18 @@ def start() -> None:
 
         temp_frame_paths = get_temp_frame_paths(modules.globals.target_path)
         total_frames = len(temp_frame_paths)
-        update_status(f'Processing {total_frames} frames with {modules.globals.execution_threads} threads...')
+
+        # Keep the frame processors on the marked range only. Files outside
+        # it stay as the extracted originals, and create_video reassembles
+        # every file in name order so the output keeps all frames.
+        if modules.globals.map_faces:
+            temp_frame_paths = sorted(temp_frame_paths)
+        else:
+            temp_frame_paths = select_temp_frames_in_range(
+                temp_frame_paths, range_start, range_end
+            )
+
+        update_status(f'Processing {len(temp_frame_paths)} of {total_frames} frames with {modules.globals.execution_threads} threads...')
 
         processing_start = time.time()
         for frame_processor in get_frame_processors_modules(modules.globals.frame_processors):
